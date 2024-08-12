@@ -11,13 +11,15 @@ import aiohttp
 from .errors import BadStatusError
 from .utils import IPPattern, IPPortPatternGlobal, get_headers, log
 
+# Suppress DeprecationWarnings from asyncio
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 class Provider:
     """Proxy provider.
 
-    Provider - a website that publish free public proxy lists.
+    Provider - a website that publishes free public proxy lists.
 
-    :param str url: Url of page where to find proxies
+    :param str url: URL of page where to find proxies
     :param tuple proto:
         (optional) List of the types (protocols) that may be supported
         by proxies returned by the provider. Then used as :attr:`Proxy.types`
@@ -32,7 +34,7 @@ class Provider:
     _pattern = IPPortPatternGlobal
 
     def __init__(
-        self, url=None, proto=(), max_conn=4, max_tries=3, timeout=20, loop=None
+        self, url=None, proto=(), max_conn=4, max_tries=3, timeout=20
     ):
         if url:
             self.domain = urlparse(url).netloc
@@ -45,7 +47,6 @@ class Provider:
         self._proxies = set()
         # concurrent connections on the current provider
         self._sem_provider = asyncio.Semaphore(max_conn)
-        self._loop = loop or asyncio.get_event_loop()
 
     @property
     def proxies(self):
@@ -72,17 +73,14 @@ class Provider:
 
         :return: :attr:`.proxies`
         """
-        log.debug('Try to get proxies from %s' % self.domain)
+        log(f'Try to get proxies from {self.domain}')
 
         async with aiohttp.ClientSession(
-            headers=get_headers(), cookies=self._cookies, loop=self._loop
+            headers=get_headers(), cookies=self._cookies
         ) as self._session:
             await self._pipe()
 
-        log.debug(
-            '%d proxies received from %s: %s'
-            % (len(self.proxies), self.domain, self.proxies)
-        )
+        log(f'{len(self.proxies)} proxies received from {self.domain}: {self.proxies}')
         return self.proxies
 
     async def _pipe(self):
@@ -108,14 +106,14 @@ class Provider:
             received = self.find_proxies(page)
         except Exception as e:
             received = []
-            log.error(
-                'Error when executing find_proxies.'
-                'Domain: %s; Error: %r' % (self.domain, e)
+            log(
+                f'Error when executing find_proxies.'
+                f'Domain: {self.domain}; Error: {e}'
             )
         self.proxies = received
         added = len(self.proxies) - oldcount
-        log.debug(
-            '%d(%d) proxies added(received) from %s' % (added, len(received), url)
+        log(
+            f'{added}({len(received)}) proxies added(received) from {url}'
         )
 
     async def get(self, url, data=None, headers=None, method='GET'):
@@ -134,21 +132,20 @@ class Provider:
             ) as resp:
                 page = await resp.text()
                 if resp.status != 200:
-                    log.debug(
-                        'url: %s\nheaders: %s\ncookies: %s\npage:\n%s'
-                        % (url, resp.headers, resp.cookies, page)
+                    log(
+                        f'url: {url}\nheaders: {resp.headers}\ncookies: {resp.cookies}\npage:\n{page}'
                     )
-                    raise BadStatusError('Status: %s' % resp.status)
+                    raise BadStatusError(f'Status: {resp.status}')
         except (
             UnicodeDecodeError,
-            BadStatusError,
+            Exception,
             asyncio.TimeoutError,
             aiohttp.ClientOSError,
             aiohttp.ClientResponseError,
             aiohttp.ServerDisconnectedError,
         ) as e:
             page = ''
-            log.debug('%s is failed. Error: %r;' % (url, e))
+            log(f'{url} is failed. Error: {e};')
         return page
 
     def find_proxies(self, page):
@@ -157,7 +154,6 @@ class Provider:
     def _find_proxies(self, page):
         proxies = self._pattern.findall(page)
         return proxies
-
 
 class Freeproxylists_com(Provider):
     domain = 'freeproxylists.com'

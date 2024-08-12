@@ -12,7 +12,7 @@ if sys.platform == 'win32':
 
 from . import __version__ as version
 from .api import Broker
-from .utils import update_geoip_db
+from .utils import update_geoip_db, log
 
 
 def create_parser():
@@ -275,34 +275,30 @@ def add_serve_args(group):
         action='store_true',
         dest='prefer_connect',
         help='''Flag that indicates whether to use
-                the CONNECT method if possible''',
-    )
-    group.add_argument(
-        '--http-allowed-codes',
-        nargs='+',
-        type=int,
-        dest='http_allowed_codes',
-        help='Acceptable HTTP codes returned by proxy on requests',
-    )
-    group.add_argument(
-        '--backlog',
-        type=int,
-        default=100,
-        help='The maximum number of queued connections passed to listen',
+                the CONNECT method instead of regular requests
+                to test HTTPS proxies''',
     )
 
 
-def add_limit_arg(group, _def=0, _help='The maximum number of working proxies'):
-    group.add_argument('--limit', '-l', type=int, default=_def, help=_help)
+def add_limit_arg(group, default=0, help=None):
+    if help is None:
+        help = 'The maximum amount of found proxies'
+    group.add_argument(
+        '--limit',
+        '-l',
+        type=int,
+        default=default,
+        help=help,
+    )
 
 
 def add_outfile_arg(group):
     group.add_argument(
         '--outfile',
         '-o',
-        type=argparse.FileType('w', 1),
+        type=argparse.FileType('w'),
         default=sys.stdout,
-        help='Save found proxies to file. By default, output to console',
+        help='Path to a result file',
     )
 
 
@@ -310,143 +306,167 @@ def add_format_arg(group):
     group.add_argument(
         '--format',
         '-f',
-        nargs='?',
-        type=str.lower,
-        help='''Flag indicating in what format the results will be presented.
-                Available formats: default, txt and json''',
+        choices=['json', 'txt'],
+        default='txt',
+        help='The format of the results to output to a file',
     )
 
 
 def add_show_stats_arg(group):
     group.add_argument(
-        '--show-stats',
-        dest='show_stats',
+        '--stats',
         action='store_true',
-        help='Flag indicating whether to print verbose stats',
+        dest='show_stats',
+        help='Display status of finding and checking in the end',
     )
 
 
 def add_help_arg(group):
     group.add_argument(
-        '--help', '-h', action='help', help='Show this help message and exit'
+        '--help',
+        '-h',
+        action='help',
+        help='Show this help message and exit',
     )
 
 
 @contextmanager
-def outformat(outfile, format):
-    is_json = format == 'json'
-    if is_json:
-        outfile.write('[\n')
+def logging_level(level):
+    current_level = logging.getLogger().getEffectiveLevel()
     try:
+        logging.getLogger().setLevel(level)
         yield
     finally:
-        if is_json:
-            outfile.write('\n]')
+        logging.getLogger().setLevel(current_level)
 
 
-async def handle(proxies, outfile, format):
-    with outformat(outfile, format):
-        is_json = format == 'json'
-        is_txt = format == 'txt'
-        is_first = True
-        while True:
-            proxy = await proxies.get()
-            if proxy is None:
-                break
+async def run_find(args):
+    async def save(proxies):
+        async with Broker(proxies) as broker:
+            async for proxy in broker:
+                if args.format == 'txt':
+                    await args.outfile.write(f"{proxy}\n")
+                elif args.format == 'json':
+                    await args.outfile.write(json.dumps(proxy.as_json()) + '\n')
 
-            if is_json:
-                line = '%s' % json.dumps(proxy.as_json())
-            elif is_txt:
-                line = proxy.as_text()
-            else:
-                line = '%r\n' % proxy
+    broker = Broker(
+        max_conn=args.max_conn,
+        max_tries=args.max_tries,
+        timeout=args.timeout,
+        judges=args.judges,
+        providers=args.providers,
+        verify_ssl=args.verify_ssl,
+        loop=asyncio.get_running_loop(),
+    )
 
-            if is_json and not is_first:
-                outfile.write(',\n')
-            outfile.write(line)
-            is_first = False
+    tasks = [
+        broker.find(
+            types=args.types,
+            anon_lvl=args.anon_lvl,
+            countries=args.countries,
+            post=args.post,
+            strict=args.strict,
+            dnsbl=args.dnsbl,
+            limit=args.limit,
+            save=save,
+        )
+    ]
 
-def cli(args=sys.argv[1:]):
+    async with logging_level(args.log):
+        await asyncio.gather(*tasks)
+
+    if args.show_stats:
+        log(f"\nFound {broker.found_cnt} proxies")
+        log(f"Checking completed: {broker.finished_cnt} proxies")
+        log(f"Proxies with error: {broker.error_cnt}")
+
+
+async def run_grab(args):
+    async def save(proxies):
+        async with Broker(proxies) as broker:
+            async for proxy in broker:
+                if args.format == 'txt':
+                    await args.outfile.write(f"{proxy}\n")
+                elif args.format == 'json':
+                    await args.outfile.write(json.dumps(proxy.as_json()) + '\n')
+
+    broker = Broker(
+        max_conn=args.max_conn,
+        max_tries=args.max_tries,
+        timeout=args.timeout,
+        judges=args.judges,
+        providers=args.providers,
+        verify_ssl=args.verify_ssl,
+        loop=asyncio.get_running_loop(),
+    )
+
+    tasks = [
+        broker.grab(
+            types=args.types,
+            countries=args.countries,
+            limit=args.limit,
+            save=save,
+        )
+    ]
+
+    async with logging_level(args.log):
+        await asyncio.gather(*tasks)
+
+    if args.show_stats:
+        log(f"\nGrabbed {broker.found_cnt} proxies")
+
+
+async def run_serve(args):
+    broker = Broker(
+        max_conn=args.max_conn,
+        max_tries=args.max_tries,
+        timeout=args.timeout,
+        judges=args.judges,
+        providers=args.providers,
+        verify_ssl=args.verify_ssl,
+        loop=asyncio.get_running_loop(),
+    )
+
+    await broker.serve(
+        host=args.host,
+        port=args.port,
+        max_tries=args.srv_max_tries or args.max_tries,
+        strategy=args.strategy,
+        min_queue=args.min_queue,
+        min_req_proxy=args.min_req_proxy,
+        max_error_rate=args.max_error_rate,
+        max_resp_time=args.max_resp_time,
+        prefer_connect=args.prefer_connect,
+    )
+
+
+def main():
     parser = create_parser()
-    ns = parser.parse_args(args)
+    args = parser.parse_args()
 
-    if not ns.command:
+    if args.command is None:
         parser.print_help()
         return
-    elif ns.command == 'update-geo':
-        ns.func()
-        return
 
-    logging.basicConfig(
-        format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
-        datefmt='[%H:%M:%S]',
-        level=ns.log,
-    )
-
-    if hasattr(ns, 'anon_lvl') and 'HTTP' in ns.types:
-        ns.types.remove('HTTP')
-        ns.types.append(('HTTP', ns.anon_lvl))
-
-    loop = asyncio.get_event_loop_policy().get_event_loop()
-    proxies = asyncio.Queue()
-    broker = Broker(
-        proxies,
-        max_conn=ns.max_conn,
-        max_tries=ns.max_tries,
-        timeout=ns.timeout,
-        judges=ns.judges,
-        providers=ns.providers,
-        verify_ssl=ns.verify_ssl,
-        loop=loop,
-    )
-
-    if ns.command in ('find', 'grab'):
-        tasks = [handle(proxies, outfile=ns.outfile, format=ns.format)]
+    if args.command == 'find':
+        func = run_find
+    elif args.command == 'grab':
+        func = run_grab
+    elif args.command == 'serve':
+        func = run_serve
+    elif args.command == 'update-geo':
+        func = args.func
     else:
-        tasks = []
+        parser.error(f"Unknown command {args.command!r}")
 
-    if ns.command == 'find':
-        tasks.append(
-            broker.find(
-                data=ns.data,
-                types=ns.types,
-                countries=ns.countries,
-                post=ns.post,
-                strict=ns.strict,
-                dnsbl=ns.dnsbl,
-                limit=ns.limit,
-            )
-        )
-    elif ns.command == 'grab':
-        tasks.append(broker.grab(countries=ns.countries, limit=ns.limit))
-    elif ns.command == 'serve':
-        broker.serve(
-            host=ns.host,
-            port=ns.port,
-            limit=ns.limit,
-            min_queue=ns.min_queue,
-            strategy=ns.strategy,
-            min_req_proxy=ns.min_req_proxy,
-            max_error_rate=ns.max_error_rate,
-            max_resp_time=ns.max_resp_time,
-            prefer_connect=ns.prefer_connect,
-            http_allowed_codes=ns.http_allowed_codes,
-            backlog=ns.backlog,
-            data=ns.data,
-            types=ns.types,
-            countries=ns.countries,
-            post=ns.post,
-            strict=ns.strict,
-            dnsbl=ns.dnsbl,
-        )
-        print('Server started at http://%s:%d' % (ns.host, ns.port))
+    if asyncio.get_running_loop().is_closed():
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
     try:
-        if tasks:
-            loop.run_until_complete(asyncio.gather(*tasks))
-            if ns.show_stats:
-                broker.show_stats(verbose=True)
-        else:
-            loop.run_forever()
+        asyncio.run(func(args))
     except KeyboardInterrupt:
-        broker.stop()
+        log('\nBye!')
+
+
+if __name__ == '__main__':
+    main()
